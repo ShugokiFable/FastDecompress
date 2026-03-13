@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "fast-decompress-skyrim",
+  "version": "1.0.0",
+  "dependencies": [
+    "commonlibsse-ng",
+    "spdlog",
+    {
+      "name": "libdeflate",
+      "features": ["decompression", "zlib"]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+build/
+install/
+out/
+.vs/
+.idea/
+.claude/
+*.user
+CMakeUserPresets.json
+vcpkg_installed/
