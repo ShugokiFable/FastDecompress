@@ -120,6 +120,12 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio")
         /Zc:preprocessor
         /Zc:__cplusplus
         /arch:AVX2
+        /Zi
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE
+        /DEBUG
+        /OPT:REF
+        /OPT:ICF
     )
 endif()
 
