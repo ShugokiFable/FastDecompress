@@ -49,8 +49,6 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
     logger::info("FastDecompressSkyrim v1.0.0 (runtime={}, game={})",
         runtime, REL::Module::get().version().string());
 
-    SKSE::AllocTrampoline(1024);
-
     // Install hooks immediately — the game exe is already mapped,
     // so sig scanning works. This ensures hooks are active during
     // initial asset loading.

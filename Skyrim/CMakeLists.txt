@@ -46,6 +46,10 @@ find_package(CommonLibSSE CONFIG REQUIRED)
 # libdeflate (for whole-buffer zlib decompression)
 find_package(libdeflate CONFIG REQUIRED)
 
+# Microsoft Detours (for function hooking — handles all x86-64 prologues)
+find_path(DETOURS_INCLUDE_DIRS "detours/detours.h")
+find_library(DETOURS_LIBRARY detours REQUIRED)
+
 # zlib-ng compat mode (built from source via FetchContent)
 include(FetchContent)
 FetchContent_Declare(
@@ -97,12 +101,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${zlibng_BINARY_DIR}"    # for generated zconf.h
     "${zlibng_SOURCE_DIR}"    # for zlib.h
     "${lz4_SOURCE_DIR}/lib"   # for lz4.h
+    ${DETOURS_INCLUDE_DIRS}   # for detours/detours.h
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     libdeflate::libdeflate_static
     zlibstatic
     lz4_static
+    ${DETOURS_LIBRARY}
 )
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

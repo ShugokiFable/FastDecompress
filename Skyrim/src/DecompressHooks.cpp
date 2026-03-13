@@ -5,6 +5,7 @@
 #include <zlib.h>  // zlib-ng compat mode — standard zlib API, SIMD-optimized
 #include <lz4.h>   // LZ4 v1.10.0
 #include <immintrin.h> // AVX2 + prefetch intrinsics
+#include <detours/detours.h>
 
 namespace FastDecompress
 {
@@ -197,208 +198,7 @@ namespace FastDecompress
     static fn_LZ4_decompress_safe s_origLZ4   = nullptr;
     static fn_LZ4_decompress_generic s_origLZ4Generic = nullptr;
 
-    // ========================================================================
-    // Instruction length decoder + trampoline creation
-    // ========================================================================
-
-    static std::size_t InsnLength(const std::uint8_t* p)
-    {
-        std::uint8_t op = p[0];
-        bool rex = (op >= 0x40 && op <= 0x4F);
-        std::uint8_t primary = rex ? p[1] : op;
-        std::size_t base = rex ? 2 : 1;
-
-        switch (primary) {
-        case 0x50: case 0x51: case 0x52: case 0x53:
-        case 0x54: case 0x55: case 0x56: case 0x57:
-        case 0x58: case 0x59: case 0x5A: case 0x5B:
-        case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-        case 0x90: case 0xC3: case 0xCC:
-            return base;
-        case 0x85: case 0x89: case 0x8B: case 0x8D:
-        case 0x33: case 0x3B: case 0x2B: {
-            std::uint8_t modrm = p[base];
-            std::uint8_t mod = modrm >> 6;
-            std::uint8_t rm = modrm & 7;
-            std::size_t len = base + 1;
-            if (rm == 4 && mod != 3) len++;
-            if (mod == 1) len++;
-            else if (mod == 2 || (mod == 0 && rm == 5)) len += 4;
-            return len;
-        }
-        case 0x83: {
-            std::uint8_t modrm = p[base];
-            std::uint8_t mod = modrm >> 6;
-            std::uint8_t rm = modrm & 7;
-            std::size_t len = base + 1 + 1;
-            if (rm == 4 && mod != 3) len++;
-            if (mod == 1) len++;
-            else if (mod == 2 || (mod == 0 && rm == 5)) len += 4;
-            return len;
-        }
-        case 0x81: case 0xC7: {
-            // 0x81: op r/m, imm32; 0xC7: mov r/m, imm32
-            std::uint8_t modrm = p[base];
-            std::uint8_t mod = modrm >> 6;
-            std::uint8_t rm = modrm & 7;
-            std::size_t len = base + 1 + 4; // modrm + imm32
-            if (rm == 4 && mod != 3) len++; // SIB
-            if (mod == 1) len++;             // disp8
-            else if (mod == 2 || (mod == 0 && rm == 5)) len += 4; // disp32
-            return len;
-        }
-        case 0x74: case 0x75:
-            return base + 1;
-        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-            // mov r32, imm32 (5 bytes) or REX.W mov r64, imm64 (10 bytes)
-            return base + ((rex && (op & 0x08)) ? 8 : 4);
-        case 0xE8:
-            return base + 4; // call rel32
-        case 0x0F: {
-            // Two-byte opcodes
-            std::uint8_t op2 = p[base];
-            if (op2 >= 0x80 && op2 <= 0x8F)
-                return base + 1 + 4; // Jcc rel32 (near conditional jumps)
-            return 0;
-        }
-        default:
-            return 0;
-        }
-    }
-
-    static std::size_t FindCopySize(std::uintptr_t func, std::size_t minBytes)
-    {
-        const auto* p = reinterpret_cast<const std::uint8_t*>(func);
-        std::size_t offset = 0;
-        while (offset < minBytes) {
-            auto len = InsnLength(p + offset);
-            if (len == 0) return 0;
-            offset += len;
-        }
-        return offset;
-    }
-
-    static void* CreateTrampoline(std::uintptr_t origFunc, std::size_t overwriteSize)
-    {
-        auto copySize = FindCopySize(origFunc, overwriteSize);
-        if (copySize == 0) {
-            logger::warn("trampoline: failed to decode instructions at {:x}", origFunc);
-            return nullptr;
-        }
-        auto& tramp = SKSE::GetTrampoline();
-        auto* mem = tramp.allocate(copySize + 14);
-        std::memcpy(mem, reinterpret_cast<const void*>(origFunc), copySize);
-
-        // Fix up relative calls (E8) in the copied prologue
-        auto* copied = reinterpret_cast<std::uint8_t*>(mem);
-        for (std::size_t pos = 0; pos < copySize; ) {
-            auto len = InsnLength(copied + pos);
-            if (len == 0) break;
-            std::uint8_t primary = copied[pos];
-            bool isRex = (primary >= 0x40 && primary <= 0x4F);
-            std::uint8_t op = isRex ? copied[pos + 1] : primary;
-            // Fix up instructions with rel32 offsets
-            bool needsFixup = false;
-            std::size_t dispOff = 0;
-            if (op == 0xE8) { // CALL rel32
-                needsFixup = true;
-                dispOff = pos + (isRex ? 2 : 1);
-            } else if (op == 0x0F && (copied[pos + (isRex ? 2 : 1)] & 0xF0) == 0x80) { // Jcc rel32
-                needsFixup = true;
-                dispOff = pos + (isRex ? 3 : 2);
-            }
-            if (needsFixup) {
-                std::int32_t oldRel;
-                std::memcpy(&oldRel, copied + dispOff, 4);
-                auto absTarget = origFunc + pos + len + oldRel;
-                auto newBase = reinterpret_cast<std::uintptr_t>(copied) + pos + len;
-                auto newRel = static_cast<std::int32_t>(absTarget - newBase);
-                std::memcpy(copied + dispOff, &newRel, 4);
-            }
-            pos += len;
-        }
-
-        auto* tail = reinterpret_cast<std::uint8_t*>(mem) + copySize;
-        tail[0] = 0xFF; tail[1] = 0x25;
-        std::uint32_t zero = 0;
-        std::memcpy(&tail[2], &zero, 4);
-        auto resumeAddr = origFunc + copySize;
-        std::memcpy(&tail[6], &resumeAddr, 8);
-        return mem;
-    }
-
-    // ========================================================================
-    // Form decompression hooks (libdeflate vs original passthrough)
-    // ========================================================================
-
-    // SE: inflateInit_(strm, version, stream_size) — 3 params
-    // VR: inflateInit2_(strm, windowBits, version, stream_size) — 4 params
-    // Accept 4 params; SE callers leave p4 unset (harmless on x64).
-    static int __cdecl Hook_FormInflateInit(z_streamp stream,
-        std::uintptr_t p2, std::uintptr_t p3, int p4)
-    {
-        if constexpr (BASELINE_MODE) {
-            return s_origInflateInit(stream, p2, p3, p4);
-        } else {
-            int ret = inflateInit2_(stream, 15, ZLIB_VERSION, static_cast<int>(sizeof(z_stream)));
-            if (ret == ZR_OK) stream->reserved = kZlibNgMagic;
-            return ret;
-        }
-    }
-
-    static int __cdecl Hook_FormInflate(z_streamp stream, int flush)
-    {
-        auto t0 = TrackCallTime();
-
-        if constexpr (BASELINE_MODE) {
-            int ret = s_origInflate(stream, flush);
-            auto dt = QpcNow() - t0;
-            s_formStats.ticks.fetch_add(dt, std::memory_order_relaxed);
-            if (ret == ZR_STREAM_END || ret == ZR_OK) {
-                s_formStats.calls.fetch_add(1, std::memory_order_relaxed);
-                s_formStats.bytesOut.fetch_add(stream->total_out, std::memory_order_relaxed);
-            }
-            return ret;
-        } else {
-            // Optimized: try libdeflate whole-buffer first
-            if (stream->total_in == 0 && stream->total_out == 0) {
-                std::size_t outBytes = 0;
-                thread_local auto* tl_decompressor = libdeflate_alloc_decompressor();
-                auto result = libdeflate_zlib_decompress(
-                    tl_decompressor,
-                    stream->next_in, stream->avail_in,
-                    stream->next_out, stream->avail_out,
-                    &outBytes);
-
-                if (result == LIBDEFLATE_SUCCESS) {
-                    auto consumed = stream->avail_in;
-                    stream->next_in += consumed;
-                    stream->avail_in = 0;
-                    stream->next_out += outBytes;
-                    stream->avail_out -= static_cast<uInt>(outBytes);
-                    stream->total_in = consumed;
-                    stream->total_out = static_cast<uLong>(outBytes);
-
-                    auto dt = QpcNow() - t0;
-                    s_formStats.ticks.fetch_add(dt, std::memory_order_relaxed);
-                    s_formStats.calls.fetch_add(1, std::memory_order_relaxed);
-                    s_formStats.bytesOut.fetch_add(outBytes, std::memory_order_relaxed);
-                    return ZR_STREAM_END;
-                }
-            }
-
-            // fallback to zlib-ng streaming
-            int ret = inflate(stream, flush);
-            auto dt = QpcNow() - t0;
-            s_formStats.ticks.fetch_add(dt, std::memory_order_relaxed);
-            if (ret == ZR_STREAM_END || ret == ZR_OK) {
-                s_formStats.calls.fetch_add(1, std::memory_order_relaxed);
-                s_formStats.bytesOut.fetch_add(stream->total_out, std::memory_order_relaxed);
-            }
-            return ret;
-        }
-    }
+    // (Trampolines managed by Microsoft Detours)
 
     // ========================================================================
     // Global zlib hooks (zlib-ng vs original passthrough)
@@ -554,50 +354,7 @@ namespace FastDecompress
     }
 
     // ========================================================================
-    // Hook helpers
-    // ========================================================================
-
-    static void WriteAbsoluteJump(std::uintptr_t targetAddr, void* newFunc)
-    {
-        DWORD oldProtect;
-        VirtualProtect(reinterpret_cast<void*>(targetAddr), 12, PAGE_EXECUTE_READWRITE, &oldProtect);
-        std::uint8_t code[12];
-        code[0] = 0x48; code[1] = 0xB8;
-        std::memcpy(&code[2], &newFunc, 8);
-        code[10] = 0xFF; code[11] = 0xE0;
-        std::memcpy(reinterpret_cast<void*>(targetAddr), code, 12);
-        VirtualProtect(reinterpret_cast<void*>(targetAddr), 12, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(targetAddr), 12);
-    }
-
-    static void DetourCall(std::uintptr_t callAddr, void* newFunc)
-    {
-        DWORD oldProtect;
-        VirtualProtect(reinterpret_cast<void*>(callAddr), 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-        auto target = reinterpret_cast<std::uintptr_t>(newFunc);
-        auto rel = static_cast<std::int32_t>(target - (callAddr + 5));
-        if (static_cast<std::int64_t>(target - (callAddr + 5)) != static_cast<std::int64_t>(rel)) {
-            auto& trampoline = SKSE::GetTrampoline();
-            auto* trampAddr = trampoline.allocate(14);
-            std::uint8_t jmp[14];
-            jmp[0] = 0xFF; jmp[1] = 0x25;
-            std::uint32_t zero = 0;
-            std::memcpy(&jmp[2], &zero, 4);
-            std::memcpy(&jmp[6], &target, 8);
-            std::memcpy(trampAddr, jmp, 14);
-            target = reinterpret_cast<std::uintptr_t>(trampAddr);
-            rel = static_cast<std::int32_t>(target - (callAddr + 5));
-        }
-        std::uint8_t call[5];
-        call[0] = 0xE8;
-        std::memcpy(&call[1], &rel, 4);
-        std::memcpy(reinterpret_cast<void*>(callAddr), call, 5);
-        VirtualProtect(reinterpret_cast<void*>(callAddr), 5, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(callAddr), 5);
-    }
-
-    // ========================================================================
-    // Signature scanning
+    // Signature scanning (VR only)
     // ========================================================================
 
     static std::uintptr_t ScanForBytes(std::uintptr_t start, std::size_t length,
@@ -621,7 +378,7 @@ namespace FastDecompress
     }
 
     // ========================================================================
-    // Signatures & offset tables
+    // VR signature tables
     // ========================================================================
 
     // --- inflate prologue (common across versions): mov [rsp+10h],edx; mov [rsp+8],rcx ---
@@ -635,25 +392,15 @@ namespace FastDecompress
     };
 
     // --- inflateInit2_ signatures per version ---
-    // VR/FO4: mov [rsp+18h],rbx; push rsi; sub rsp,20h
+    // VR: mov [rsp+18h],rbx; push rsi; sub rsp,20h
     static constexpr std::uint8_t kSig_inflateInit2_v1[] = {
         0x48, 0x89, 0x5C, 0x24, 0x18, 0x56, 0x48, 0x83, 0xEC, 0x20,
     };
-    // AE 1.6.1170: REX push rbx; sub rsp,20h; mov rbx,rcx; test rdx,rdx
-    // (Ghidra-verified real inflateInit2_ at offset +0x1A90)
-    static constexpr std::uint8_t kSig_inflateInit2_AE[] = {
-        0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xD2,
-    };
 
-    // --- inflateReset signatures per version ---
-    // VR/FO4: test rcx,rcx; jz xx; mov rax,[rcx+28h]
+    // --- inflateReset signatures ---
+    // VR: test rcx,rcx; jz xx; mov rax,[rcx+28h]
     static constexpr std::uint8_t kSig_inflateReset_VR[] = {
         0x48, 0x85, 0xC9,
-    };
-    // AE 1.6.1170: mov rax,rcx; test rcx,rcx
-    // (Ghidra-verified real inflateResetKeep at offset +0x1C70)
-    static constexpr std::uint8_t kSig_inflateReset_AE[] = {
-        0x48, 0x8B, 0xC1, 0x48, 0x85, 0xC9,
     };
 
     // --- Cluster 2 signatures (VR second inflate copy) ---
@@ -682,20 +429,13 @@ namespace FastDecompress
         std::size_t resetSigLen;
     };
 
-    // Cluster 1 offset tables (inflate starts with kSig_inflatePrefix)
-    static constexpr InflateOffsets kOffsets_AE1170 = {
-        0x18A0, 0x1A90, 0x1C70,
-        kSig_inflateInit2_AE, sizeof(kSig_inflateInit2_AE),
-        kSig_inflateReset_AE, sizeof(kSig_inflateReset_AE)
-    };
     static constexpr InflateOffsets kOffsets_VR = {
         0x19E0, 0x1A70, 0x1C30,
         kSig_inflateInit2_v1, sizeof(kSig_inflateInit2_v1),
         kSig_inflateReset_VR, sizeof(kSig_inflateReset_VR)
     };
-    static constexpr InflateOffsets kAllOffsets_c1[] = { kOffsets_AE1170, kOffsets_VR };
+    static constexpr InflateOffsets kAllOffsets_c1[] = { kOffsets_VR };
 
-    // Cluster 2 offset tables (inflate starts with kSig_inflate_v2)
     static constexpr InflateOffsets kOffsets_c2_VR = {
         0xCA0, 0xD80, 0x1280,
         kSig_inflateInit2_v3, sizeof(kSig_inflateInit2_v3),
@@ -720,7 +460,6 @@ namespace FastDecompress
     };
 
     // LZ4_decompress_generic: 6-param internal function (BSA frame block decompressor)
-    // Prologue: mov [rsp+18h],rbx; push rbp..r15; lea rbp,[rsp-17h]; sub rsp,0E0h
     static constexpr std::uint8_t kSig_LZ4_decompress_generic[] = {
         0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57,
         0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
@@ -770,20 +509,6 @@ namespace FastDecompress
         return false;
     }
 
-    static bool IsInflateAddr(std::uintptr_t addr)
-    {
-        for (int i = 0; i < s_clusterCount; i++)
-            if (s_clusters[i].inflate == addr) return true;
-        return false;
-    }
-
-    static bool IsInflateInit2Addr(std::uintptr_t addr)
-    {
-        for (int i = 0; i < s_clusterCount; i++)
-            if (addr == s_clusters[i].inflateInit2) return true;
-        return false;
-    }
-
     // ========================================================================
     // Address Library IDs for SE/AE (stable across all versions)
     // ========================================================================
@@ -793,6 +518,18 @@ namespace FastDecompress
     static constexpr REL::ID kID_inflateInit2(56881);
     static constexpr REL::ID kID_inflateReset(56888);
     static constexpr REL::ID kID_LZ4_decompress_generic(110040);
+
+    // Detours helper: attach a single hook, logging success/failure.
+    static bool DetourAttachHook(void** ppOriginal, void* pHook, const char* name)
+    {
+        LONG err = DetourAttach(ppOriginal, pHook);
+        if (err != NO_ERROR) {
+            logger::error("DetourAttach({}) failed: error {}", name, err);
+            return false;
+        }
+        logger::info("  hooked {} at {:x}", name, reinterpret_cast<std::uintptr_t>(*ppOriginal));
+        return true;
+    }
 
     void Install()
     {
@@ -815,13 +552,12 @@ namespace FastDecompress
         const auto textSize = textSeg.size();
 
         // ============================================================
-        // Step 1: Locate zlib inflate cluster
-        // SE/AE: Address Library (works across all versions)
-        // VR: Signature scanning (no Address Library, version is frozen)
+        // Step 1: Locate function addresses
+        // SE/AE: Address Library
+        // VR: Signature scanning
         // ============================================================
 
         if (!isVR) {
-            // SE/AE: Use Address Library IDs — guaranteed correct on any version
             s_clusters[0] = {
                 kID_inflate.address(),
                 kID_inflateEnd.address(),
@@ -833,7 +569,6 @@ namespace FastDecompress
             logger::info("inflate cluster 1 via AddressLib at {:x} (end={:x} init2={:x} reset={:x})",
                 c.inflate, c.inflateEnd, c.inflateInit2, c.inflateReset);
         } else {
-            // VR: Signature scanning
             FindCluster(textBase, textSize,
                 kSig_inflatePrefix, sizeof(kSig_inflatePrefix),
                 kAllOffsets_c1, std::size(kAllOffsets_c1),
@@ -850,125 +585,104 @@ namespace FastDecompress
         else
             logger::info("found {} inflate cluster(s)", s_clusterCount);
 
-        // Step 2: Create trampolines from the first cluster
-        if (s_clusterCount > 0) {
-            auto& c = s_clusters[0];
-            s_origInflate = reinterpret_cast<fn_inflate>(CreateTrampoline(c.inflate, 12));
-            s_origInflateEnd = reinterpret_cast<fn_inflateEnd>(CreateTrampoline(c.inflateEnd, 12));
-            s_origInflateReset = reinterpret_cast<fn_inflateReset>(CreateTrampoline(c.inflateReset, 12));
-            s_origInflateInit = reinterpret_cast<fn_inflateInit>(CreateTrampoline(c.inflateInit2, 12));
+        // ============================================================
+        // Step 2: Find LZ4 addresses
+        // ============================================================
 
-            if (!s_origInflate || !s_origInflateEnd || !s_origInflateReset || !s_origInflateInit) {
-                logger::error("failed to create zlib trampolines");
-                s_clusterCount = 0;
-            }
-        }
-
-        // Step 3: Form hooks — scan for CALL instructions targeting inflate
-        int formHooked = 0;
-        if (s_clusterCount > 0) {
-            for (std::size_t i = 0; i + 5 <= textSize; i++) {
-                auto callAddr = textBase + i;
-                if (*reinterpret_cast<const std::uint8_t*>(callAddr) != 0xE8) continue;
-
-                std::int32_t rel32;
-                std::memcpy(&rel32, reinterpret_cast<const void*>(callAddr + 1), 4);
-                auto target = static_cast<std::uintptr_t>(
-                    static_cast<std::int64_t>(callAddr) + 5 + rel32);
-                if (!IsInflateAddr(target)) continue;
-
-                std::uintptr_t initCallAddr = 0;
-                auto maxBack = std::min<std::size_t>(i, 0x200);
-                for (std::size_t j = 5; j <= maxBack; j++) {
-                    auto prevAddr = callAddr - j;
-                    if (*reinterpret_cast<const std::uint8_t*>(prevAddr) != 0xE8) continue;
-                    std::int32_t prevRel;
-                    std::memcpy(&prevRel, reinterpret_cast<const void*>(prevAddr + 1), 4);
-                    auto prevTarget = static_cast<std::uintptr_t>(
-                        static_cast<std::int64_t>(prevAddr) + 5 + prevRel);
-                    if (IsInflateInit2Addr(prevTarget)) {
-                        initCallAddr = prevAddr;
-                        break;
-                    }
-                }
-                if (!initCallAddr) continue;
-
-                DetourCall(initCallAddr, reinterpret_cast<void*>(&Hook_FormInflateInit));
-                DetourCall(callAddr, reinterpret_cast<void*>(&Hook_FormInflate));
-                formHooked++;
-            }
-        }
-
-        // Step 4: Global zlib hooks — overwrite all cluster functions
-        for (int i = 0; i < s_clusterCount; i++) {
-            auto& c = s_clusters[i];
-            WriteAbsoluteJump(c.inflate, reinterpret_cast<void*>(&Hook_inflate));
-            WriteAbsoluteJump(c.inflateEnd, reinterpret_cast<void*>(&Hook_inflateEnd));
-            WriteAbsoluteJump(c.inflateInit2, reinterpret_cast<void*>(&Hook_inflateInit));
-            WriteAbsoluteJump(c.inflateReset, reinterpret_cast<void*>(&Hook_inflateReset));
-        }
-
-        // Step 5: LZ4_decompress_safe (sig scan — not in Address Library, 0 calls observed)
+        std::uintptr_t lz4SafeAddr = 0;
         {
             std::size_t scanPos = 0;
-            while (true) {
-                auto lz4Addr = ScanForBytes(textBase, textSize,
-                    kSig_LZ4_decompress_safe, sizeof(kSig_LZ4_decompress_safe), &scanPos);
-                if (!lz4Addr) break;
-
-                s_origLZ4 = reinterpret_cast<fn_LZ4_decompress_safe>(
-                    CreateTrampoline(lz4Addr, 12));
-                if (!s_origLZ4) {
-                    logger::error("failed to create LZ4 trampoline");
-                    break;
-                }
-
-                WriteAbsoluteJump(lz4Addr, reinterpret_cast<void*>(&Hook_LZ4_decompress_safe));
-                s_lz4Hooked = true;
-                logger::info("LZ4 hooked at {:x}", lz4Addr);
-                break;
-            }
-            if (!s_lz4Hooked)
-                logger::warn("LZ4 NOT hooked");
+            lz4SafeAddr = ScanForBytes(textBase, textSize,
+                kSig_LZ4_decompress_safe, sizeof(kSig_LZ4_decompress_safe), &scanPos);
         }
 
-        // Step 6: LZ4_decompress_generic (BSA frame block decompressor)
-        // SE/AE: Address Library; VR: Signature scanning
-        {
-            std::uintptr_t lz4GenAddr = 0;
-            if (!isVR) {
-                lz4GenAddr = kID_LZ4_decompress_generic.address();
-                logger::info("LZ4_decompress_generic via AddressLib at {:x}", lz4GenAddr);
-            } else {
-                std::size_t scanPos = 0;
-                lz4GenAddr = ScanForBytes(textBase, textSize,
-                    kSig_LZ4_decompress_generic, sizeof(kSig_LZ4_decompress_generic), &scanPos);
-            }
-
-            if (lz4GenAddr) {
-                s_origLZ4Generic = reinterpret_cast<fn_LZ4_decompress_generic>(
-                    CreateTrampoline(lz4GenAddr, 12));
-                if (s_origLZ4Generic) {
-                    WriteAbsoluteJump(lz4GenAddr, reinterpret_cast<void*>(&Hook_LZ4_decompress_generic));
-                    s_lz4GenericHooked = true;
-                    logger::info("LZ4_decompress_generic hooked at {:x}", lz4GenAddr);
-                } else {
-                    logger::error("failed to create LZ4_decompress_generic trampoline");
-                }
-            }
-            if (!s_lz4GenericHooked)
-                logger::warn("LZ4_decompress_generic NOT hooked — BSA frame decompression unoptimized");
+        std::uintptr_t lz4GenAddr = 0;
+        if (!isVR) {
+            lz4GenAddr = kID_LZ4_decompress_generic.address();
+            logger::info("LZ4_decompress_generic via AddressLib at {:x}", lz4GenAddr);
+        } else {
+            std::size_t scanPos = 0;
+            lz4GenAddr = ScanForBytes(textBase, textSize,
+                kSig_LZ4_decompress_generic, sizeof(kSig_LZ4_decompress_generic), &scanPos);
         }
 
-        logger::info("hooks installed: clusters={} formCallSites={} lz4={} lz4frame={}",
-            s_clusterCount, formHooked, s_lz4Hooked ? "yes" : "no",
+        // ============================================================
+        // Step 3: Install all hooks via Microsoft Detours
+        // ============================================================
+
+        // Set original pointers to the resolved addresses (Detours requires this)
+        if (s_clusterCount > 0) {
+            auto& c = s_clusters[0];
+            s_origInflate      = reinterpret_cast<fn_inflate>(c.inflate);
+            s_origInflateEnd   = reinterpret_cast<fn_inflateEnd>(c.inflateEnd);
+            s_origInflateInit  = reinterpret_cast<fn_inflateInit>(c.inflateInit2);
+            s_origInflateReset = reinterpret_cast<fn_inflateReset>(c.inflateReset);
+        }
+        if (lz4SafeAddr)
+            s_origLZ4 = reinterpret_cast<fn_LZ4_decompress_safe>(lz4SafeAddr);
+        if (lz4GenAddr)
+            s_origLZ4Generic = reinterpret_cast<fn_LZ4_decompress_generic>(lz4GenAddr);
+
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        int hooked = 0;
+        if (s_clusterCount > 0) {
+            hooked += DetourAttachHook(reinterpret_cast<void**>(&s_origInflate),
+                reinterpret_cast<void*>(&Hook_inflate), "inflate");
+            hooked += DetourAttachHook(reinterpret_cast<void**>(&s_origInflateEnd),
+                reinterpret_cast<void*>(&Hook_inflateEnd), "inflateEnd");
+            hooked += DetourAttachHook(reinterpret_cast<void**>(&s_origInflateInit),
+                reinterpret_cast<void*>(&Hook_inflateInit), "inflateInit2");
+            hooked += DetourAttachHook(reinterpret_cast<void**>(&s_origInflateReset),
+                reinterpret_cast<void*>(&Hook_inflateReset), "inflateReset");
+        }
+
+        if (s_origLZ4) {
+            s_lz4Hooked = DetourAttachHook(reinterpret_cast<void**>(&s_origLZ4),
+                reinterpret_cast<void*>(&Hook_LZ4_decompress_safe), "LZ4_decompress_safe");
+            hooked += s_lz4Hooked;
+        }
+
+        if (s_origLZ4Generic) {
+            s_lz4GenericHooked = DetourAttachHook(reinterpret_cast<void**>(&s_origLZ4Generic),
+                reinterpret_cast<void*>(&Hook_LZ4_decompress_generic), "LZ4_decompress_generic");
+            hooked += s_lz4GenericHooked;
+        }
+
+        LONG err = DetourTransactionCommit();
+        if (err != NO_ERROR) {
+            logger::error("DetourTransactionCommit failed: error {}", err);
+        }
+
+        // Hook extra VR inflate clusters (cluster 2+) via additional transactions
+        for (int i = 1; i < s_clusterCount; i++) {
+            auto& c = s_clusters[i];
+            auto* origInf   = reinterpret_cast<void*>(c.inflate);
+            auto* origEnd   = reinterpret_cast<void*>(c.inflateEnd);
+            auto* origInit  = reinterpret_cast<void*>(c.inflateInit2);
+            auto* origReset = reinterpret_cast<void*>(c.inflateReset);
+
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            DetourAttach(&origInf,   reinterpret_cast<void*>(&Hook_inflate));
+            DetourAttach(&origEnd,   reinterpret_cast<void*>(&Hook_inflateEnd));
+            DetourAttach(&origInit,  reinterpret_cast<void*>(&Hook_inflateInit));
+            DetourAttach(&origReset, reinterpret_cast<void*>(&Hook_inflateReset));
+            DetourTransactionCommit();
+            logger::info("inflate cluster {} hooked via Detours", i + 1);
+        }
+
+        if (!s_lz4Hooked)
+            logger::warn("LZ4_decompress_safe NOT hooked");
+        if (!s_lz4GenericHooked)
+            logger::warn("LZ4_decompress_generic NOT hooked — BSA frame decompression unoptimized");
+
+        logger::info("hooks installed: {} total, clusters={} lz4={} lz4frame={}",
+            hooked, s_clusterCount, s_lz4Hooked ? "yes" : "no",
             s_lz4GenericHooked ? "yes" : "no");
-        if (formHooked == 0 && s_clusterCount > 0) {
-            logger::info("  (no form CALL detours — form decompression still optimized via global inflate hook)");
-        }
 
         // Stats logging thread: frequent early (loading phase), then every 60s
-        // 5s, 10s, 15s, 20s, 25s, 30s, 45s, 60s, then every 60s
         std::thread([]() {
             int intervals[] = {5, 5, 5, 5, 5, 5, 15, 15};
             for (int s : intervals) {

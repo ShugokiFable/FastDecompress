@@ -8,6 +8,7 @@
     {
       "name": "libdeflate",
       "features": ["decompression", "zlib"]
-    }
+    },
+    "detours"
   ]
 }
