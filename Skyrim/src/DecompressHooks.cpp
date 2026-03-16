@@ -14,8 +14,8 @@ namespace FastDecompress
     //             false for optimized (zlib-ng + libdeflate + LZ4 v1.10).
     // ========================================================================
 
-    static constexpr const char* kVersion = "1.0.0";
     static constexpr bool BASELINE_MODE = false;
+    static bool s_enableStats = false; // loaded from INI at runtime
 
     // ========================================================================
     // QPC timing helpers
@@ -82,10 +82,16 @@ namespace FastDecompress
         int64_t  lz4Ticks;
         double   elapsed;
     };
-    static Snapshot s_prev{};
+    static Snapshot s_prev{};          // only accessed from the logging thread
+    static DWORD s_logThreadId = 0;   // set once by the logging thread
 
     void LogStats()
     {
+        // Guard: s_prev is not thread-safe — assert single-thread access
+        DWORD tid = GetCurrentThreadId();
+        DWORD expected = 0;
+        if (!s_logThreadId) s_logThreadId = tid;
+        assert(s_logThreadId == tid && "LogStats must only be called from the logging thread");
         double elapsed = TicksToMs(QpcNow() - s_installTime);
 
         auto fc = s_formStats.calls.load();
@@ -182,9 +188,12 @@ namespace FastDecompress
     using fn_inflate      = int (__cdecl*)(z_streamp, int);
     using fn_inflateEnd   = int (__cdecl*)(z_streamp);
     using fn_inflateReset = int (__cdecl*)(z_streamp);           // Skyrim: 1 param only
-    // SE: inflateInit_ (strm, version, stream_size) — 3 params
+    // SE/AE: inflateInit_ (strm, version, stream_size) — 3 params
+    using fn_inflateInit_SE = int (__cdecl*)(z_streamp, const char*, int);
     // VR: inflateInit2_ (strm, windowBits, version, stream_size) — 4 params
-    // Use generic 4-param type; SE callers just leave R9 unset (ignored by 3-param original).
+    using fn_inflateInit_VR = int (__cdecl*)(z_streamp, int, const char*, int);
+    // Union type for Detours (must be one pointer). 4-param covers both; on x64
+    // Windows ABI, passing extra register args to a 3-param function is harmless.
     using fn_inflateInit  = int (__cdecl*)(z_streamp, std::uintptr_t, std::uintptr_t, int);
     using fn_LZ4_decompress_safe = int (__cdecl*)(const char*, char*, int, int);
     // LZ4_decompress_generic: 6-param internal function used by BSResource::CompressedArchiveStream
@@ -197,6 +206,7 @@ namespace FastDecompress
     static fn_inflateInit  s_origInflateInit  = nullptr;
     static fn_LZ4_decompress_safe s_origLZ4   = nullptr;
     static fn_LZ4_decompress_generic s_origLZ4Generic = nullptr;
+    static bool s_isVR = false;  // set during Install(), used for correct baseline forwarding
 
     // (Trampolines managed by Microsoft Detours)
 
@@ -208,13 +218,19 @@ namespace FastDecompress
     // ========================================================================
 
     // Global inflateInit hook — 4 params to handle both SE and VR.
-    // SE callers pass (strm, version, stream_size); VR callers pass (strm, wbits, version, stream_size).
-    // In optimized mode all params are ignored; in baseline mode they're forwarded as-is.
+    // SE/AE callers pass (strm, version, stream_size); VR passes (strm, wbits, version, stream_size).
+    // In baseline mode we forward with the correct arity per runtime.
     static int __cdecl Hook_inflateInit(z_streamp strm,
         std::uintptr_t p2, std::uintptr_t p3, int p4)
     {
         if constexpr (BASELINE_MODE) {
-            return s_origInflateInit(strm, p2, p3, p4);
+            if (s_isVR) {
+                return reinterpret_cast<fn_inflateInit_VR>(s_origInflateInit)(
+                    strm, static_cast<int>(p2), reinterpret_cast<const char*>(p3), p4);
+            } else {
+                return reinterpret_cast<fn_inflateInit_SE>(s_origInflateInit)(
+                    strm, reinterpret_cast<const char*>(p2), static_cast<int>(p3));
+            }
         } else {
             int ret = inflateInit2_(strm, 15, ZLIB_VERSION, static_cast<int>(sizeof(z_stream)));
             if (ret == ZR_OK) strm->reserved = kZlibNgMagic;
@@ -224,25 +240,32 @@ namespace FastDecompress
 
     static int __cdecl Hook_inflate(z_streamp strm, int flush)
     {
-        auto t0 = TrackCallTime();
-        uint32_t outBefore = strm->avail_out;
+        // #2: Only prefetch on first call; continuations already have data warm in cache
+        if constexpr (!BASELINE_MODE) {
+            if (strm->total_in == 0)
+                PrefetchSource(strm->next_in, strm->avail_in);
+        }
+        [[maybe_unused]] auto t0 = s_enableStats ? TrackCallTime() : 0;
+        [[maybe_unused]] uint32_t outBefore = s_enableStats ? strm->avail_out : 0;
 
         int ret;
         if constexpr (BASELINE_MODE) {
             ret = s_origInflate(strm, flush);
         } else {
             // Auto-detect one-shot (form) decompression: try libdeflate on first call.
-            // This catches form inflate on VR where indirect calls bypass the E8 scanner.
-            if (strm->total_in == 0 && strm->total_out == 0 && strm->reserved == kZlibNgMagic) {
+            // #4: Skip if avail_out < 256 — too small for a complete form, must be streaming.
+            if (strm->total_in == 0 && strm->total_out == 0 &&
+                strm->reserved == kZlibNgMagic && strm->avail_out >= 256) {
                 std::size_t outBytes = 0;
-                thread_local auto* tl_decompressor = libdeflate_alloc_decompressor();
+                struct DecompDeleter { void operator()(libdeflate_decompressor* d) { libdeflate_free_decompressor(d); } };
+                thread_local std::unique_ptr<libdeflate_decompressor, DecompDeleter> tl_decompressor(libdeflate_alloc_decompressor());
                 auto result = libdeflate_zlib_decompress(
-                    tl_decompressor,
+                    tl_decompressor.get(),
                     strm->next_in, strm->avail_in,
                     strm->next_out, strm->avail_out,
                     &outBytes);
 
-                if (result == LIBDEFLATE_SUCCESS) {
+                if (result == LIBDEFLATE_SUCCESS && outBytes <= strm->avail_out) {
                     auto consumed = strm->avail_in;
                     strm->next_in += consumed;
                     strm->avail_in = 0;
@@ -251,10 +274,12 @@ namespace FastDecompress
                     strm->total_in = consumed;
                     strm->total_out = static_cast<uLong>(outBytes);
 
-                    auto dt = QpcNow() - t0;
-                    s_formStats.ticks.fetch_add(dt, std::memory_order_relaxed);
-                    s_formStats.calls.fetch_add(1, std::memory_order_relaxed);
-                    s_formStats.bytesOut.fetch_add(outBytes, std::memory_order_relaxed);
+                    if (s_enableStats) {
+                        auto dt = QpcNow() - t0;
+                        s_formStats.ticks.fetch_add(dt, std::memory_order_relaxed);
+                        s_formStats.calls.fetch_add(1, std::memory_order_relaxed);
+                        s_formStats.bytesOut.fetch_add(outBytes, std::memory_order_relaxed);
+                    }
                     return ZR_STREAM_END;
                 }
             }
@@ -263,15 +288,17 @@ namespace FastDecompress
             if (strm->reserved == kZlibNgMagic) {
                 ret = inflate(strm, flush);
             } else {
-                s_stockZlibCalls.fetch_add(1, std::memory_order_relaxed);
+                if (s_enableStats) s_stockZlibCalls.fetch_add(1, std::memory_order_relaxed);
                 ret = s_origInflate(strm, flush);
             }
         }
 
-        auto dt = QpcNow() - t0;
-        s_streamStats.ticks.fetch_add(dt, std::memory_order_relaxed);
-        s_streamStats.calls.fetch_add(1, std::memory_order_relaxed);
-        s_streamStats.bytesOut.fetch_add(outBefore - strm->avail_out, std::memory_order_relaxed);
+        if (s_enableStats) {
+            auto dt = QpcNow() - t0;
+            s_streamStats.ticks.fetch_add(dt, std::memory_order_relaxed);
+            s_streamStats.calls.fetch_add(1, std::memory_order_relaxed);
+            s_streamStats.bytesOut.fetch_add(outBefore - strm->avail_out, std::memory_order_relaxed);
+        }
         return ret;
     }
 
@@ -303,8 +330,8 @@ namespace FastDecompress
     static int __cdecl Hook_LZ4_decompress_safe(const char* src, char* dst,
         int compressedSize, int dstCapacity)
     {
-        PrefetchSource(src, compressedSize);
-        auto t0 = TrackCallTime();
+        if constexpr (!BASELINE_MODE) PrefetchSource(src, compressedSize);
+        [[maybe_unused]] auto t0 = s_enableStats ? TrackCallTime() : 0;
 
         int ret;
         if constexpr (BASELINE_MODE) {
@@ -313,11 +340,13 @@ namespace FastDecompress
             ret = LZ4_decompress_safe(src, dst, compressedSize, dstCapacity);
         }
 
-        auto dt = QpcNow() - t0;
-        s_lz4Stats.ticks.fetch_add(dt, std::memory_order_relaxed);
-        s_lz4Stats.calls.fetch_add(1, std::memory_order_relaxed);
-        if (ret > 0)
-            s_lz4Stats.bytesOut.fetch_add(ret, std::memory_order_relaxed);
+        if (s_enableStats) {
+            auto dt = QpcNow() - t0;
+            s_lz4Stats.ticks.fetch_add(dt, std::memory_order_relaxed);
+            s_lz4Stats.calls.fetch_add(1, std::memory_order_relaxed);
+            if (ret > 0)
+                s_lz4Stats.bytesOut.fetch_add(ret, std::memory_order_relaxed);
+        }
         return ret;
     }
 
@@ -327,8 +356,13 @@ namespace FastDecompress
     static int __cdecl Hook_LZ4_decompress_generic(const char* src, char* dst,
         int srcSize, int outputSize, const char* dictStart, int dictSize)
     {
-        PrefetchSource(src, srcSize);
-        auto t0 = TrackCallTime();
+        if constexpr (!BASELINE_MODE) {
+            PrefetchSource(src, srcSize);
+            // #3: Prefetch dictionary data too — it will be read during decompression
+            if (dictSize > 0 && dictStart != nullptr)
+                PrefetchSource(dictStart, dictSize);
+        }
+        [[maybe_unused]] auto t0 = s_enableStats ? TrackCallTime() : 0;
 
         int ret;
         if constexpr (BASELINE_MODE) {
@@ -341,15 +375,17 @@ namespace FastDecompress
             }
         }
 
-        auto dt = QpcNow() - t0;
-        s_lz4Stats.ticks.fetch_add(dt, std::memory_order_relaxed);
-        s_lz4Stats.calls.fetch_add(1, std::memory_order_relaxed);
-        if (ret > 0)
-            s_lz4Stats.bytesOut.fetch_add(ret, std::memory_order_relaxed);
-        if (dictSize > 0)
-            s_lz4DictCalls.fetch_add(1, std::memory_order_relaxed);
-        else
-            s_lz4NoDictCalls.fetch_add(1, std::memory_order_relaxed);
+        if (s_enableStats) {
+            auto dt = QpcNow() - t0;
+            s_lz4Stats.ticks.fetch_add(dt, std::memory_order_relaxed);
+            s_lz4Stats.calls.fetch_add(1, std::memory_order_relaxed);
+            if (ret > 0)
+                s_lz4Stats.bytesOut.fetch_add(ret, std::memory_order_relaxed);
+            if (dictSize > 0)
+                s_lz4DictCalls.fetch_add(1, std::memory_order_relaxed);
+            else
+                s_lz4NoDictCalls.fetch_add(1, std::memory_order_relaxed);
+        }
         return ret;
     }
 
@@ -377,8 +413,17 @@ namespace FastDecompress
         return std::memcmp(reinterpret_cast<const void*>(addr), expected, len) == 0;
     }
 
+    // Check if an address points to a dead stub (ret / ret N / int3 padding).
+    // SE 1.5.97 Address Library maps some IDs to empty stubs instead of real functions.
+    static bool IsStubFunction(std::uintptr_t addr)
+    {
+        const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
+        // C3 = ret, C2 xx xx = ret N, CC = int3 (padding/dead code)
+        return p[0] == 0xC3 || p[0] == 0xC2 || p[0] == 0xCC;
+    }
+
     // ========================================================================
-    // VR signature tables
+    // Signature tables (VR + SE 1.5.97 fallback)
     // ========================================================================
 
     // --- inflate prologue (common across versions): mov [rsp+10h],edx; mov [rsp+8],rcx ---
@@ -519,6 +564,36 @@ namespace FastDecompress
     static constexpr REL::ID kID_inflateReset(56888);
     static constexpr REL::ID kID_LZ4_decompress_generic(110040);
 
+    // Follow jump thunks to find the real function body.
+    // SE 1.5.97 Address Library points to small jump stubs (thunks), not the
+    // actual function code. Hooking a thunk that the game never calls through
+    // results in 0 intercepted calls. This resolves the chain to the real target.
+    static std::uintptr_t ResolveThunk(std::uintptr_t addr)
+    {
+        // Follow chains of thunks (thunk → thunk → real function).
+        // Cap iterations to avoid infinite loops on malformed code.
+        for (int i = 0; i < 8; i++) {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(addr);
+
+            // E9 xx xx xx xx = jmp rel32
+            if (p[0] == 0xE9) {
+                auto offset = *reinterpret_cast<const std::int32_t*>(p + 1);
+                addr = addr + 5 + offset;
+                continue;
+            }
+
+            // FF 25 xx xx xx xx = jmp [rip+disp32]  (indirect jump)
+            if (p[0] == 0xFF && p[1] == 0x25) {
+                auto disp = *reinterpret_cast<const std::int32_t*>(p + 2);
+                addr = *reinterpret_cast<const std::uintptr_t*>(addr + 6 + disp);
+                continue;
+            }
+
+            break; // not a thunk — already the real function
+        }
+        return addr;
+    }
+
     // Detours helper: attach a single hook, logging success/failure.
     static bool DetourAttachHook(void** ppOriginal, void* pHook, const char* name)
     {
@@ -531,14 +606,31 @@ namespace FastDecompress
         return true;
     }
 
+    // Load settings from FastDecompressSkyrim.ini (next to the DLL)
+    static void LoadINI()
+    {
+        HMODULE hm = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&LoadINI), &hm);
+        char dllPath[MAX_PATH]{};
+        GetModuleFileNameA(hm, dllPath, MAX_PATH);
+        std::filesystem::path iniPath = std::filesystem::path(dllPath).replace_extension(".ini");
+
+        s_enableStats = GetPrivateProfileIntA("General", "bEnableLogging", 0, iniPath.string().c_str()) != 0;
+    }
+
     void Install()
     {
+        LoadINI();
+
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
         s_qpcFreq = freq.QuadPart;
         s_installTime = QpcNow();
 
         const bool isVR = REL::Module::IsVR();
+        s_isVR = isVR;
         const char* runtime = isVR ? "VR" : "SE/AE";
 
         logger::info("FastDecompressSkyrim v{} mode={} runtime={} game={} base={:x}",
@@ -557,18 +649,31 @@ namespace FastDecompress
         // VR: Signature scanning
         // ============================================================
 
+        bool useAddressLib = false;
         if (!isVR) {
-            s_clusters[0] = {
-                kID_inflate.address(),
-                kID_inflateEnd.address(),
-                kID_inflateInit2.address(),
-                kID_inflateReset.address()
-            };
-            s_clusterCount = 1;
-            auto& c = s_clusters[0];
-            logger::info("inflate cluster 1 via AddressLib at {:x} (end={:x} init2={:x} reset={:x})",
-                c.inflate, c.inflateEnd, c.inflateInit2, c.inflateReset);
-        } else {
+            // Try Address Library first. On AE it returns real function bodies.
+            // On SE 1.5.97 it returns dead stubs (C2 00 00 = ret 0).
+            auto inflateAddr = ResolveThunk(kID_inflate.address());
+            if (!IsStubFunction(inflateAddr)) {
+                s_clusters[0] = {
+                    inflateAddr,
+                    ResolveThunk(kID_inflateEnd.address()),
+                    ResolveThunk(kID_inflateInit2.address()),
+                    ResolveThunk(kID_inflateReset.address())
+                };
+                s_clusterCount = 1;
+                useAddressLib = true;
+                auto& c = s_clusters[0];
+                logger::info("inflate cluster 1 via AddressLib at {:x} (end={:x} init2={:x} reset={:x})",
+                    c.inflate, c.inflateEnd, c.inflateInit2, c.inflateReset);
+            } else {
+                logger::warn("AddressLib inflate points to stub ({:x}) — falling back to signature scan",
+                    inflateAddr);
+            }
+        }
+
+        if (!useAddressLib) {
+            // Signature scanning: VR always, SE 1.5.97 as fallback
             FindCluster(textBase, textSize,
                 kSig_inflatePrefix, sizeof(kSig_inflatePrefix),
                 kAllOffsets_c1, std::size(kAllOffsets_c1),
@@ -597,13 +702,24 @@ namespace FastDecompress
         }
 
         std::uintptr_t lz4GenAddr = 0;
-        if (!isVR) {
-            lz4GenAddr = kID_LZ4_decompress_generic.address();
-            logger::info("LZ4_decompress_generic via AddressLib at {:x}", lz4GenAddr);
-        } else {
+        if (useAddressLib) {
+            auto raw = kID_LZ4_decompress_generic.address();
+            auto resolved = ResolveThunk(raw);
+            // Verify resolved address is within the game module (not a system DLL)
+            if (resolved >= textBase && resolved < textBase + textSize) {
+                lz4GenAddr = resolved;
+                logger::info("LZ4_decompress_generic via AddressLib at {:x}", lz4GenAddr);
+            } else {
+                logger::warn("AddressLib LZ4_decompress_generic resolved outside game module ({:x}) — using sig scan",
+                    resolved);
+            }
+        }
+        if (!lz4GenAddr) {
             std::size_t scanPos = 0;
             lz4GenAddr = ScanForBytes(textBase, textSize,
                 kSig_LZ4_decompress_generic, sizeof(kSig_LZ4_decompress_generic), &scanPos);
+            if (lz4GenAddr)
+                logger::info("LZ4_decompress_generic via sig scan at {:x}", lz4GenAddr);
         }
 
         // ============================================================
@@ -682,19 +798,21 @@ namespace FastDecompress
             hooked, s_clusterCount, s_lz4Hooked ? "yes" : "no",
             s_lz4GenericHooked ? "yes" : "no");
 
-        // Stats logging thread: frequent early (loading phase), then every 60s
-        std::thread([]() {
-            int intervals[] = {5, 5, 5, 5, 5, 5, 15, 15};
-            for (int s : intervals) {
-                std::this_thread::sleep_for(std::chrono::seconds(s));
-                if (s_stopLogging.load(std::memory_order_relaxed)) return;
-                LogStats();
-            }
-            while (!s_stopLogging.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::chrono::seconds(60));
-                if (s_stopLogging.load(std::memory_order_relaxed)) return;
-                LogStats();
-            }
-        }).detach();
+        // Stats logging thread: only spawn if stats are enabled
+        if (s_enableStats) {
+            std::thread([]() {
+                int intervals[] = {5, 5, 5, 5, 5, 5, 15, 15};
+                for (int s : intervals) {
+                    std::this_thread::sleep_for(std::chrono::seconds(s));
+                    if (s_stopLogging.load(std::memory_order_relaxed)) return;
+                    LogStats();
+                }
+                while (!s_stopLogging.load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(60));
+                    if (s_stopLogging.load(std::memory_order_relaxed)) return;
+                    LogStats();
+                }
+            }).detach();
+        }
     }
 }
