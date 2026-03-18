@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.23)
 
 set(NAME "FastDecompressSkyrim")
-set(VERSION 1.1.0)
+set(VERSION 1.2.0)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 
