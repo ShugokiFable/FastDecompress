@@ -1,0 +1,11 @@
+build/
+release/
+out/
+.vs/
+*.user
+*.suo
+*.db
+*.opendb
+*.7z
+CMakeSettings.json
+FalloutNewVegas/

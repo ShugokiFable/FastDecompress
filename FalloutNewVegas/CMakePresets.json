@@ -1,0 +1,27 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "vs2022-windows",
+            "displayName": "Visual Studio 2022 (Win32)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "Win32",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release",
+            "configurePreset": "vs2022-windows",
+            "configuration": "Release"
+        },
+        {
+            "name": "debug",
+            "configurePreset": "vs2022-windows",
+            "configuration": "Debug"
+        }
+    ]
+}
