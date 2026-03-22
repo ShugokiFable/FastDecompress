@@ -102,7 +102,7 @@ target_compile_definitions(chromium_zlib_static PRIVATE
     _CRT_SECURE_NO_WARNINGS
 )
 if(MSVC)
-    target_compile_options(chromium_zlib_static PRIVATE /O2 /Oi /GL /W0 /arch:AVX2)
+    target_compile_options(chromium_zlib_static PRIVATE /O2 /Oi /GL /W0)
 endif()
 message(">>> Chromium zlib built from source (SSE2 inflate, SSSE3 adler32)")
 
