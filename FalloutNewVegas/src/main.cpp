@@ -47,7 +47,7 @@ bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)
 {
     info->infoVersion = PluginInfo::kInfoVersion;
     info->name = "FastDecompressNV";
-    info->version = 100; // 1.0.0
+    info->version = 110; // 1.1
 
     // Require xNVSE 6.2.0+
     if (!nvse->isEditor && nvse->nvseVersion < 0x06020000) {

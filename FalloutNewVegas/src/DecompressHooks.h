@@ -9,7 +9,7 @@
 
 namespace FastDecompress
 {
-    static constexpr const char* kVersion = "1.0.0";
+    static constexpr const char* kVersion = "1.1";
 
     // Install all hooks (call once at plugin load)
     void Install(bool isEditor);
