@@ -1,7 +1,7 @@
 #include "DecompressHooks.h"
 
 #include <libdeflate.h>
-#include <zlib.h>       // chromium-zlib — SSE2/AVX2 SIMD streaming inflate for BSA
+#include <zlib.h>       // chromium-zlib — SSE2 SIMD streaming inflate for BSA
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -476,6 +476,8 @@ namespace FastDecompress
         LogInfo("  stats=%s  mode=%s",
             s_enableStats ? "ON" : "OFF",
             s_baselineMode ? "BASELINE" : "OPTIMIZED");
+
+
 
         if (!isEditor) {
             // Save original function pointers for baseline mode
