@@ -1,0 +1,48 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  skyrim:
+    name: Build Skyrim plugin (release preset)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Resolve vcpkg
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_ROOT
+          if (-not $root) { $root = $env:VCPKG_INSTALLATION_ROOT }
+          if (-not $root) { $root = "C:\vcpkg" }
+          if (-not (Test-Path (Join-Path $root "scripts/buildsystems/vcpkg.cmake"))) {
+            throw "Could not locate vcpkg under $root"
+          }
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure
+        working-directory: Skyrim
+        run: cmake --preset release
+
+      - name: Build
+        run: cmake --build Skyrim/build/release --parallel 2
+
+      - name: Verify DLL was produced
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter *.dll Skyrim/build | Select-Object -First 1
+          if (-not $dll) { throw "Build produced no DLL." }
+          Write-Host "Built $($dll.FullName)"
